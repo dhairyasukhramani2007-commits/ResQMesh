@@ -1,0 +1,279 @@
+#include <SPI.h>
+#include <LoRa.h>
+
+static const long RADIO_FREQ = 433E6;
+
+static const int RADIO_SS = 5;
+static const int RADIO_RST = 14;
+static const int RADIO_DIO0 = 26;
+
+static const char *GATEWAY_ID = "GATEWAY_01";
+
+static const int CACHE_SIZE = 100;
+
+String seenIDs[CACHE_SIZE];
+
+int nextSeen = 0;
+
+
+// Initialize LoRa
+bool startRadio() {
+
+  SPI.begin(18, 19, 23, RADIO_SS);
+
+  LoRa.setPins(
+    RADIO_SS,
+    RADIO_RST,
+    RADIO_DIO0
+  );
+
+  if (!LoRa.begin(RADIO_FREQ)) {
+    return false;
+  }
+
+  LoRa.setSpreadingFactor(7);
+  LoRa.setSignalBandwidth(125E3);
+  LoRa.setCodingRate4(5);
+  LoRa.setSyncWord(0x12);
+
+  LoRa.receive();
+
+  return true;
+}
+
+
+// Send LoRa packet
+bool radioSend(const String &message) {
+
+  LoRa.idle();
+
+  if (LoRa.beginPacket() != 1) {
+
+    LoRa.receive();
+
+    return false;
+  }
+
+  LoRa.print(message);
+
+  bool ok = LoRa.endPacket() == 1;
+
+  LoRa.receive();
+
+  return ok;
+}
+
+
+// Split CSV fields
+int splitFields(
+  const String &line,
+  String *fields,
+  int capacity
+) {
+
+  int count = 0;
+  int start = 0;
+
+  for (
+    unsigned int i = 0;
+    i <= line.length();
+    i++
+  ) {
+
+    if (
+      i == line.length() ||
+      line[i] == ','
+    ) {
+
+      if (count >= capacity) {
+        return -1;
+      }
+
+      fields[count++] =
+        line.substring(start, i);
+
+      start = i + 1;
+    }
+  }
+
+  return count;
+}
+
+
+// Validate number
+bool validNumber(
+  const String &value,
+  int &number
+) {
+
+  if (
+    value.isEmpty() ||
+    value.length() > 3
+  ) {
+    return false;
+  }
+
+  for (
+    unsigned int i = 0;
+    i < value.length();
+    i++
+  ) {
+
+    if (
+      value[i] < '0' ||
+      value[i] > '9'
+    ) {
+      return false;
+    }
+  }
+
+  number = value.toInt();
+
+  return number >= 0 && number <= 20;
+}
+
+
+// Prevent duplicate dashboard alerts
+bool firstArrival(const String &id) {
+
+  for (int i = 0; i < CACHE_SIZE; i++) {
+
+    if (seenIDs[i] == id) {
+      return false;
+    }
+  }
+
+  seenIDs[nextSeen] = id;
+
+  nextSeen =
+    (nextSeen + 1) % CACHE_SIZE;
+
+  return true;
+}
+
+
+// Setup
+void setup() {
+
+  Serial.begin(115200);
+
+  delay(1000);
+
+  Serial.println(
+    "RESQMESH GATEWAY STARTING"
+  );
+
+  if (!startRadio()) {
+
+    Serial.println(
+      "LORA INIT FAILED"
+    );
+
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  Serial.println(
+    "GATEWAY READY"
+  );
+}
+
+
+// Main loop
+void loop() {
+
+  if (LoRa.parsePacket() <= 0) {
+    return;
+  }
+
+  String msg;
+
+  while (LoRa.available()) {
+    msg += (char)LoRa.read();
+  }
+
+  int rssi = LoRa.packetRssi();
+
+  float snr = LoRa.packetSnr();
+
+  String fields[8];
+
+  if (
+    splitFields(msg, fields, 8) != 8 ||
+    fields[0] != "SOS"
+  ) {
+    return;
+  }
+
+  int ttl = 0;
+  int priority = 0;
+
+  if (
+    fields[1].isEmpty() ||
+    fields[2].isEmpty() ||
+    fields[3].isEmpty() ||
+    fields[5].isEmpty() ||
+    !validNumber(fields[6], ttl) ||
+    !validNumber(fields[4], priority) ||
+    ttl <= 0 ||
+    priority < 1 ||
+    priority > 3
+  ) {
+    return;
+  }
+
+  bool isNew =
+    firstArrival(fields[1]);
+
+  Serial.println(
+    "RECEIVED SOS: " + msg
+  );
+
+  Serial.println(
+    "Last hop: " + fields[7]
+  );
+
+  Serial.println(
+    "RSSI=" + String(rssi) +
+    " SNR=" + String(snr)
+  );
+
+  if (isNew) {
+
+    // Send emergency to dashboard
+
+    Serial.println(
+      "RESQMESH_EVENT," +
+      fields[1] + "," +
+      fields[2] + "," +
+      fields[3] + "," +
+      fields[4] + "," +
+      fields[5] + "," +
+      String(rssi) + "," +
+      String(snr, 2)
+    );
+
+  } else {
+
+    Serial.println(
+      "Duplicate alert ignored in dashboard"
+    );
+  }
+
+  // Send ACK even for duplicate packets
+
+  String ack =
+    "ACK," +
+    fields[1] +
+    ",4," +
+    GATEWAY_ID;
+
+  delay(100);
+
+  Serial.println(
+    "ACK: " + ack
+  );
+
+  radioSend(ack);
+}
